@@ -62,3 +62,4 @@ cython_debug/
 .tmp-project-imports/
 
 *.pkl
+*__pycache__*
