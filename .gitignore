@@ -61,4 +61,4 @@ celerybeat.pid
 cython_debug/
 .tmp-project-imports/
 
-.pkl
+*.pkl
