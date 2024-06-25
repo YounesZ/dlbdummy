@@ -3,6 +3,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from os import path, sep
+from copy import deepcopy
 from config import ROOT_PATH
 from xgboost import XGBClassifier
 from datetime import datetime
@@ -15,17 +16,22 @@ from src.utils import (read_date,
                        simple_imputer,
                        match_patterns_to_iterable,
                        agregate_minor_classes,
-                       get_stopwords_stems,
                        replace_exact_match,
-                       stem_string)
+                       stem_string,
+                       recode_keys,
+                       label_project,
+                       clean_text,
+                       split_dates,
+                       feat_label_split)
 from sklearn.svm import SVC
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report
 from sklearn.multioutput import MultiOutputClassifier
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 
-TEXT_CLEANING = get_stopwords_stems()
 
 
 def define_defaul_params():
@@ -96,7 +102,7 @@ def prep_experiment():
     df = pd.read_csv( path.join(ROOT_PATH, 'data', 'dummy_dataset.csv') )
 
     # Train <2021 /test >= 2021split
-    train = [read_date(i_)[0].year<2020 for i_ in df['Date_Comptable']]
+    train = df.Date_facture.apply(lambda x: read_date(x)[0].year<2020)
     df_train = df.loc[train]
     df_test = df.loc[~np.array(train)]
 
@@ -254,35 +260,173 @@ def run_eval_pipeline(df, **kwargs):
     return ev_train, ev_valid
 
 
+class Pipeline(object):
+
+    def __init__(self, params):
+        self.params = params
+
+    def fit(self, X):
+        # --- Assemble pipeline
+        # ---------------------
+        # Recode keys
+        X = recode_keys(X, self.params)
+
+        # Correct labels
+        X = static_label_correction(X, 'Service ABC', 'Activite ABC', None, re.compile(r'Projets \d{4} - '), '')
+
+        # Label project
+        X = label_project(X)
+
+        # Agregate
+        X, _ = agregate_minor_classes(X, ['Service ABC', 'Activite ABC'], 100)
+
+        # Clean text --- train
+        X = clean_text(X)
+
+        # Train/Test split
+        X_train, X_test = train_test_split(X, test_size=0.3, shuffle=True, stratify=X['Service ABC'], random_state=42)
+
+        # Exclude infrequent words
+        infrq = pd.Series(np.hstack(X_train['clean_text'].apply(lambda x: x.split()))).value_counts()
+        infrq = list(infrq[infrq < 20].index) + [i_ for i_ in infrq.index if len(str(i_)) < 3]
+        X_train.loc[:, 'clean_text'] = X_train['clean_text'].apply(lambda x: " ".join(list(set(x.split()).difference(infrq))))
+
+        # TD-IDF vectorizer
+        print('\tTD-IDF vectorizer ...', end='')
+        self.vectorizer = TfidfVectorizer(use_idf=True)
+        self.vectorizer.fit(X_train.loc[~X_train['clean_text'].isna(), 'clean_text'])
+        X_train = tdfidfvectorizer(X_train, ['clean_text'], ['clean_text_vec'], [self.vectorizer])
+        print('done.')
+
+        # OneHot encoder
+        print('\tOneHot encoder ...', end='')
+        in_columns = ['key01', 'key03', 'Nom_fournisseur', 'Ordonnateur']
+        self.hotencoders = [OneHotEncoder(handle_unknown='ignore') for i_ in in_columns]
+        for i_,j_ in zip(in_columns, self.hotencoders):
+            j_.fit(np.expand_dims(X_train.loc[~X_train[i_].isna(), i_], axis=1))
+        X_train = onehot_encoder(X_train, in_columns, self.hotencoders)
+        print('done.')
+
+        # Categorical encoder
+        print('\tCategorical encoder ...', end='')
+        in_columns = ['Activite ABC', 'Service ABC']
+        self.catencoders = [LabelEncoder() for i_ in in_columns]
+        for i_,j_ in zip(in_columns, self.catencoders):
+            j_.fit(np.expand_dims(X_train.loc[~X_train[i_].isna(), i_], axis=1))
+        X_train = categorical_encoder(X_train, in_columns, in_columns, self.catencoders)
+        print('done.')
+
+        # Split dates Jour/Mois
+        X_train = split_dates(X_train)
+
+        # Imputation
+        print('\tImputation ...', end='')
+        in_columns = ['Montant_Ligne_Facture', 'jour_facture', 'mois_facture']
+        self.imputer = SimpleImputer()
+        self.imputer.fit(X_train[in_columns], None)
+        X_train = simple_imputer(X_train, in_columns, self.imputer)
+        print('done.')
+
+        # Feature/Label splitter
+        X_train, y_train = feat_label_split(X_train)
+
+        # Standard scaler
+        print('\tstandard scaler ...', end='')
+        self.scl = StandardScaler()
+        X_train = self.scl.fit_transform(X_train)
+        print('done.')
+
+        # Modelling
+        self.mdl = MultiOutputClassifier(estimator=XGBClassifier())
+        self.mdl.fit(X_train, y_train.astype(int))
+        return X, X_test
+
+
+    def predict(self, X):
+        # --- Assemble pipeline
+        # ---------------------
+        # Recode keys
+        X = recode_keys(X, self.params)
+
+        # Correct labels
+        X = static_label_correction(X, 'Service ABC', 'Activite ABC', None, re.compile(r'Projets \d{4} - '), '')
+
+        # Label project
+        X = label_project(X)
+
+        # Agregate
+        X, _ = agregate_minor_classes(X, ['Service ABC', 'Activite ABC'], 100)
+
+        # Clean text --- train
+        X = clean_text(X)
+
+        # Exclude infrequent words
+        infrq = pd.Series(np.hstack(X['clean_text'].apply(lambda x: x.split()))).value_counts()
+        infrq = list(infrq[infrq < 20].index) + [i_ for i_ in infrq.index if len(str(i_)) < 3]
+        X['clean_text'] = X['clean_text'].apply(lambda x: " ".join(list(set(x.split()).difference(infrq))))
+
+        # TD-IDF vectorizer
+        X = tdfidfvectorizer(X, ['clean_text'], ['clean_text_vec'], [self.vectorizer])
+
+        # OneHot encoder
+        in_columns = ['key01', 'key03', 'Nom_fournisseur', 'Ordonnateur']
+        X = onehot_encoder(X, in_columns, self.hotencoders)
+
+        # Categorical encoder
+        in_columns = ['Activite ABC', 'Service ABC']
+        X = categorical_encoder(X, in_columns, in_columns, self.catencoders)
+
+        # Split dates Jour/Mois
+        X = split_dates(X)
+
+        # Imputation
+        in_columns = ['Montant_Ligne_Facture', 'jour_facture', 'mois_facture']
+        X = simple_imputer(X, in_columns, self.imputer)
+
+        # Feature/Label splitter
+        X, y = feat_label_split(X)
+
+        # Standard scaler
+        X = self.scl.transform(X)
+
+        # --- Train pipeline
+        # ------------------
+        y_pred = self.mdl.predict(X)
+        return y, y_pred
+
+
 class Experiment(object):
 
     def __init__(self, name, df_train, df_test, pipe_type='full', run_eval=True, **kwargs):
         # Internal params
         self.name = name
         self.params = kwargs
+        self.pipeline = Pipeline(kwargs)
         self.run_eval = run_eval
         self.pipe_type = pipe_type
 
         # Run training/inference
-        self.y_train, self.y_pred_tr, self.y_valid, self.y_pred_vl = run_pipeline(df_train, **kwargs)
-        #self.y_test, self.y_pred_ts = self.pipeline.predict(df_test)
+        self.X_train, self.X_valid = self.pipeline.fit(df_train)
+        self.y_tr_true, self.y_tr_pred = self.pipeline.predict(self.X_train)
+        self.y_vl_true, self.y_vl_pred = self.pipeline.predict(self.X_valid)
+        self.y_ts_true, self.y_ts_pred = self.pipeline.predict(df_test)
 
         # Make sure shapes are OK
-        self.y_pred_tr = self.y_pred_tr.reshape(self.y_train.shape)
-        self.y_pred_vl = self.y_pred_vl.reshape(self.y_valid.shape)
-        #self.y_pred_ts = self.y_pred_ts.reshape(self.y_test.shape)
+        self.y_tr_pred = self.y_tr_pred.reshape(self.y_tr_true.shape)
+        self.y_vl_pred = self.y_vl_pred.reshape(self.y_vl_true.shape)
+        self.y_ts_pred = self.y_ts_pred.reshape(self.y_ts_true.shape)
 
         # Make sure type is OK
-        self.y_pred_tr = self.y_pred_tr.astype( type(np.ravel( self.y_train )[0]) )
-        self.y_pred_vl = self.y_pred_vl.astype( type(np.ravel( self.y_valid )[0]) )
-        #self.y_pred_ts = self.y_pred_ts.astype( type(np.ravel( self.y_test )[0]) )
+        self.y_tr_pred = self.y_tr_pred.astype( type(np.ravel( self.y_tr_true )[0]) )
+        self.y_vl_pred = self.y_vl_pred.astype( type(np.ravel( self.y_vl_true )[0]) )
+        self.y_ts_pred = self.y_ts_pred.astype( type(np.ravel( self.y_ts_true )[0]) )
 
-        if isinstance(self.y_train, pd.Series) or isinstance(self.y_train, pd.DataFrame):
-            self.y_train = self.y_train.values
-        if isinstance(self.y_valid, pd.Series) or isinstance(self.y_valid, pd.DataFrame):
-            self.y_valid = self.y_valid.values
-        #if isinstance(self.y_test, pd.Series) or isinstance(self.y_test, pd.DataFrame):
-        #    self.y_test = self.y_test.values
+        if isinstance(self.y_tr_true, pd.Series) or isinstance(self.y_tr_true, pd.DataFrame):
+            self.y_tr_true = self.y_tr_true.values
+        if isinstance(self.y_vl_true, pd.Series) or isinstance(self.y_vl_true, pd.DataFrame):
+            self.y_vl_true = self.y_vl_true.values
+        if isinstance(self.y_ts_true, pd.Series) or isinstance(self.y_ts_true, pd.DataFrame):
+            self.y_ts_true = self.y_ts_true.values
 
         # Determine classification type
         labels = kwargs['AWBFeatureLabelSplitter']['labels']
@@ -292,14 +436,14 @@ class Experiment(object):
 
             self.ev_train = []
             self.ev_valid = []
-            #self.ev_test = []
+            self.ev_test = []
 
             for x_, i_ in enumerate(labels):
                 # Train
-                y_true, y_pred = self.y_train[:, x_], self.y_pred_tr[:, x_]
+                y_true, y_pred = self.y_tr_true[:, x_], self.y_tr_pred[:, x_]
                 self.ev_train.append(printout_metrics(y_true.astype(int), y_pred))
                 # Valid
-                y_true, y_pred = self.y_valid[:, x_], self.y_pred_vl[:, x_]
+                y_true, y_pred = self.y_vl_true[:, x_], self.y_vl_pred[:, x_]
                 self.ev_valid.append(printout_metrics(y_true.astype(int), y_pred))
                 # Test
                 #y_true, y_pred = self.y_test[:, x_], self.y_pred_ts[:, x_]
@@ -334,12 +478,17 @@ class Experiment(object):
         # Prep scores
         scr = self.ev_valid[-1].loc[ ['macro avg', 'weighted avg'], 'f1-score']
 
-        # Make path
-        savep = sep.join([ROOT_PATH, "models", "Pipeline_%s_%s_test_macro_%.3f_wavg_%.3f.pkl"]) % (pipetype, tmstamp, scr['macro avg'], scr['weighted avg'])
-
-        # Save pipeline
+        # Save Experiment
+        savep = sep.join([ROOT_PATH, "models", "Experiment_%s_%s_test_macro_%.3f_wavg_%.3f.pkl"]) % (pipetype, tmstamp, scr['macro avg'], scr['weighted avg'])
         with open(savep, 'wb') as f:
             pickle.dump(self, f)
+
+        # Save Pipeline
+        savep = sep.join([ROOT_PATH, "models", "Pipeline_%s_%s_test_macro_%.3f_wavg_%.3f.pkl"]) % (
+        pipetype, tmstamp, scr['macro avg'], scr['weighted avg'])
+        with open(savep, 'wb') as f:
+            pickle.dump(self.pipeline, f)
+
 
     def load(self, filename):
         # Make path

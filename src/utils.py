@@ -8,8 +8,6 @@ from scipy.sparse import csr_matrix
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder
-from sklearn.feature_extraction.text import TfidfVectorizer
-
 
 
 def read_date(tmstamp):
@@ -51,12 +49,14 @@ def replace_exact_match(srs, pattern, replacement=""):
 
 
 def static_label_correction(X, out_col_service, out_col_activite, project_prefix, replacement_pattern, replacement_collapse):
+    print('\tcorrecting labels ...', end='')
+
     # --- Remove lines not to use
     fltr = X['Line to use'] == 0
     X = X[~fltr]
 
     # --- Replace keys: Service
-    X[out_col_service] = X['Service ABC']
+    X.loc[:, out_col_service] = X['Service ABC']
     # Rule 1: all services with ~SET_IN_ACT_KET <- KA
     fltr = X['Service ABC'] == '~SET_IN_ACT_KEY'
     X.loc[fltr, out_col_service] = X.loc[fltr, 'KA']
@@ -65,7 +65,7 @@ def static_label_correction(X, out_col_service, out_col_activite, project_prefix
     X.loc[fltr, out_col_service] = X.loc[fltr, 'KP']
 
     # --- Replace Keys: Activite
-    X[out_col_activite] = X['Activite ABC']
+    X.loc[:, out_col_activite] = X['Activite ABC']
     # Rule 5: all non-empty KA -> Activité
     fltr = ~X['KA'].isnull()
     X.loc[fltr, out_col_activite] = X.loc[fltr, 'KA']
@@ -79,20 +79,12 @@ def static_label_correction(X, out_col_service, out_col_activite, project_prefix
     # Rule 4: Stringify NaNs
     X.loc[X[out_col_activite].isna(), out_col_activite] = "nan"
     X.loc[X[out_col_service].isna(), out_col_service] = "nan"
+
+    print('done.')
     return X
 
 
-def tdfidfvectorizer(X, in_columns, out_prefix):
-    VECTO = []
-    for i_ in in_columns:
-        VECTO.append(TfidfVectorizer(use_idf=True))
-
-    for i_, j_ in zip(in_columns, VECTO):
-        # Extract + transform column
-        i_col = X[i_]
-        # Remove NaNs
-        i_col_nan = i_col[~i_col.isna()]
-        j_.fit(i_col_nan)
+def tdfidfvectorizer(X, in_columns, out_prefix, VECTO):
 
     # Turn dataframe column to list
     for i_, j_, k_ in zip(in_columns, VECTO, out_prefix):
@@ -114,17 +106,7 @@ def tdfidfvectorizer(X, in_columns, out_prefix):
     return X
 
 
-def onehot_encoder(X, in_columns):
-    encoders = [OneHotEncoder(handle_unknown='ignore') for i_ in in_columns]
-
-    # Loop on input columns
-    for i_, j_ in zip(in_columns, encoders):
-        # Isolate column - without nans
-        i_col = X.loc[~X[i_].isna(), i_]
-        i_col_exp = np.expand_dims(i_col, axis=1)
-        # Encode
-        j_.fit(i_col_exp)
-
+def onehot_encoder(X, in_columns, encoders):
     # Loop on input columns
     for i_, j_ in zip(in_columns, encoders):
 
@@ -152,15 +134,7 @@ def onehot_encoder(X, in_columns):
     return X
 
 
-def categorical_encoder(X, in_columns, out_columns):
-    encoders = [LabelEncoder() for i_ in in_columns]
-
-    for i_, j_ in zip(in_columns, encoders):
-        # Isolate column - without nans
-        i_col = X.loc[~X[i_].isna(), i_]
-        i_col_exp = np.expand_dims(i_col, axis=1)
-        # Encode
-        j_.fit(i_col_exp)
+def categorical_encoder(X, in_columns, out_columns, encoders):
 
     # Loop on input columns
     for i_, j_, k_ in zip(in_columns, out_columns, encoders):
@@ -181,13 +155,7 @@ def categorical_encoder(X, in_columns, out_columns):
     return X
 
 
-def simple_imputer(X, in_columns):
-    # Instantiate
-    imputer = SimpleImputer()
-
-    # Fit
-    X_i = X.loc[:, in_columns].copy()
-    imputer.fit(X_i, None)
+def simple_imputer(X, in_columns, imputer):
 
     # Transform
     # Do imputation
@@ -213,17 +181,22 @@ def match_patterns_to_iterable(patterns, itr):
     return FT
 
 
-def agregate_minor_classes(col, threshold, agregate_classes=None):
-    if agregate_classes is None:
+def agregate_minor_classes(df, cols, threshold, agregate_classes=None):
+    print('\tagregating minor classes ...', end='')
+
+    for i_ in cols:
+
         # Make value count
-        vc = col.value_counts()
+        vc = df[i_].value_counts()
         ir = vc < threshold
         agregate_classes = ir[ir].index
 
-    # New column
-    ncol = col.copy()
-    ncol[ncol.isin(agregate_classes)] = 'AGREGATED'
-    return ncol, agregate_classes
+        # New column
+        ncol = df[i_].copy()
+        ncol[ncol.isin(agregate_classes)] = 'AGREGATED'
+        df.loc[:, i_] = ncol.values
+    print('done.')
+    return df, agregate_classes
 
 
 def get_stopwords_stems():
@@ -259,3 +232,59 @@ def stem_string(sentence, stems):
         ),
         sentence,
     )
+
+
+def recode_keys(X, params):
+    print('\trecoding keys ...', end='')
+    if 'key02' in X.columns:
+        X.loc[:, params['UCfact_recode_keys']['output_mapping']['key02']] = X['key02'] > 500
+    # Key04
+    if 'key04' in X.columns:
+        X.loc[:, params['UCfact_recode_keys']['output_mapping']['key02']] = X['key04'] > 500
+    print('done.')
+    return X
+
+
+def label_project(X):
+    print('\tlabelling projects ...', end='')
+    matching_elements = [element for pattern in ['PRO*', 'CONSUL', 'DEVSUP'] for element in
+                         X['Activite ABC'].unique() if re.search(pattern, element)]
+    n_col = np.zeros(len(X))
+    n_col[X['Activite ABC'].isin(matching_elements)] = 1
+    X.loc[:, 'is_project'] = n_col
+    print('done.')
+    return X
+
+
+def clean_text(X):
+    print('\tCleaning text ...', end='')
+    TEXT_CLEANING = get_stopwords_stems()
+
+    X.loc[:, 'clean_text'] = X[['Objet_Facture', 'descp']].astype(str).agg(' '.join, axis=1)
+    X.loc[:, 'clean_text'] = X['clean_text'].apply(lambda x: re.sub(r"[,\.;'°\+_\-/\\]", " ", x))
+    X.loc[:, 'clean_text'] = X['clean_text'].apply(lambda x: x.lower())
+    X.loc[:, 'clean_text'] = X['clean_text'].apply(lambda x: re.sub('[^0-9a-zA-Z ]', '', x))
+    X.loc[:, 'clean_text'] = X['clean_text'].apply(lambda x: " ".join(x.split()))
+    X.loc[:, 'clean_text'] = replace_exact_match(X['clean_text'], TEXT_CLEANING['STOPWORDS'])
+    X.loc[:, 'clean_text'] = X['clean_text'].apply(stem_string, args=(TEXT_CLEANING['STEMS'],))
+    print('done.')
+    return X
+
+
+def split_dates(X):
+    print('\tSplitting dates ...', end='')
+
+    X.loc[:, 'jour_facture'] = X['Date_facture'].apply(
+        lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S.%f').day)
+    X.loc[:, 'mois_facture'] = X['Date_facture'].apply(
+        lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S.%f').month)
+    print("done. ")
+    return X
+
+
+def feat_label_split(X):
+    print('\tSplitting features labels ...', end='')
+    y = X[match_patterns_to_iterable(['is_project', 'Activite ABC', 'Service ABC'], X.columns)]
+    X = X[match_patterns_to_iterable(['Montant_Ligne_Facture', 'jour_facture', 'key02_r', 'Nom_fournisseur_vec*', 'Ordonnateur_vec*','clean_text_vec*'], X.columns)]
+    print("done. ")
+    return X, y
